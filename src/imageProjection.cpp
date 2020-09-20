@@ -86,13 +86,21 @@ private:
 
 
 public:
+
+	/**
+	 * 构造函数 
+	 */
     ImageProjection():
     deskewFlag(0)
     {
+		/* 订阅IMU原始数据，交给imuHandler处理 */
         subImu        = nh.subscribe<sensor_msgs::Imu>(imuTopic, 2000, &ImageProjection::imuHandler, this, ros::TransportHints().tcpNoDelay());
+		/* 订阅IMUPreintegration发布的里程计信息，交给odometryHandler处理 */
         subOdom       = nh.subscribe<nav_msgs::Odometry>(odomTopic+"_incremental", 2000, &ImageProjection::odometryHandler, this, ros::TransportHints().tcpNoDelay());
+        /* 订阅点云的原始数据，交给cloudHandler处理，cloudHandler是本类的核心函数 */
         subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>(pointCloudTopic, 5, &ImageProjection::cloudHandler, this, ros::TransportHints().tcpNoDelay());
 
+		/* 创建发布，准备发布点云数据 */
         pubExtractedCloud = nh.advertise<sensor_msgs::PointCloud2> ("lio_sam/deskew/cloud_deskewed", 1);
         pubLaserCloudInfo = nh.advertise<lio_sam::cloud_info> ("lio_sam/deskew/cloud_info", 1);
 
@@ -141,6 +149,9 @@ public:
 
     ~ImageProjection(){}
 
+	/**
+	 * 处理来自IMU的原始数据，仅仅是压入imuQueue
+	 */
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imuMsg)
     {
         sensor_msgs::Imu thisImu = imuConverter(*imuMsg);
@@ -166,29 +177,43 @@ public:
         // cout << "roll: " << imuRoll << ", pitch: " << imuPitch << ", yaw: " << imuYaw << endl << endl;
     }
 
+	/**
+	 * 处理来自IMUPreintegration的里程计数据，仅仅是压入odomQueue
+	 */
     void odometryHandler(const nav_msgs::Odometry::ConstPtr& odometryMsg)
     {
         std::lock_guard<std::mutex> lock2(odoLock);
         odomQueue.push_back(*odometryMsg);
     }
 
+	/**
+	 * 处理点云的原始数据，本函数是imageProjection类的核心函数
+	 */
     void cloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
     {
+		/* 缓存点云原始数据，并将点云从ROS转成PCL格式 */
         if (!cachePointCloud(laserCloudMsg))
             return;
 
+		/* 获得当前点云帧对应的旋转和平移量，准备进行点云的帧内校正 */ 
         if (!deskewInfo())
             return;
 
+		/* 按照行列对齐的方式对点云进行重排列，并进行帧内校正 */
         projectPointCloud();
 
+		/* 从整理好的点云中提取有效点，一维化，准备发布 */
         cloudExtraction();
 
+		/* 发布点云 */
         publishClouds();
 
         resetParameters();
     }
 
+	/**
+ 	 * 缓存点云原始数据，并将点云从ROS转成PCL格式。
+	 */
     bool cachePointCloud(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
     {
         // cache point cloud
@@ -203,6 +228,7 @@ public:
 
         // get timestamp
         cloudHeader = currentCloudMsg.header;
+			/* 当前帧点云TS和下一帧点云TS */
         timeScanCur = cloudHeader.stamp.toSec();
         timeScanEnd = timeScanCur + laserCloudIn->points.back().time; // Velodyne
         // timeScanEnd = timeScanCur + (float)laserCloudIn->points.back().t / 1000000000.0; // Ouster
@@ -253,6 +279,10 @@ public:
         return true;
     }
 
+	/**
+ 	 * 获得当前点云帧对应的旋转和平移量，旋转来自对IMU数据的积分，平移来自
+	 * IMUPreintegration的里程计信息，用于点云的帧内校正。
+	 */
     bool deskewInfo()
     {
         std::lock_guard<std::mutex> lock1(imuLock);
@@ -272,6 +302,12 @@ public:
         return true;
     }
 
+	/**
+	 * 对IMU角速度进行积分，获得每一帧IMU数据相对于当前点云帧起始时刻对应的旋转量，
+	 * 保存下来，用于点云的帧内校正。这个做法比较简单，与livox_horizon_loam使用李
+	 * 代数对IMU积分结果转成李代数进行插值的做法相比精度肯定会差一些，但是计算更简
+	 * 单。
+	 */
     void imuDeskewInfo()
     {
         cloudInfo.imuAvailable = false;
@@ -331,6 +367,10 @@ public:
         cloudInfo.imuAvailable = true;
     }
 
+	/**
+	 * 从来自IMUPreintegration的里程计信息获得当前点云帧期间的总平移，保存下来，用
+	 * 于点云的帧内校正。
+	 */
     void odomDeskewInfo()
     {
         cloudInfo.odomAvailable = false;
@@ -413,6 +453,9 @@ public:
         odomDeskewFlag = true;
     }
 
+	/**
+	 * 获得指定时刻对应的旋转，旋转量来自IMU角速度积分
+	 */
     void findRotation(double pointTime, float *rotXCur, float *rotYCur, float *rotZCur)
     {
         *rotXCur = 0; *rotYCur = 0; *rotZCur = 0;
@@ -440,6 +483,9 @@ public:
         }
     }
 
+	/**
+	 * 获得指定时刻对应的平移，平移量原本来自里程计，但是并未实施
+	 */
     void findPosition(double relTime, float *posXCur, float *posYCur, float *posZCur)
     {
         *posXCur = 0; *posYCur = 0; *posZCur = 0;
@@ -456,29 +502,38 @@ public:
         // *posZCur = ratio * odomIncreZ;
     }
 
+	/**
+	 * 对点进行帧内校正
+	 */
     PointType deskewPoint(PointType *point, double relTime)
     {
         if (deskewFlag == -1 || cloudInfo.imuAvailable == false)
             return *point;
 
+		/* 获得当前点的时间戳 */
         double pointTime = timeScanCur + relTime;
 
+		/* 找到当前点对应的旋转 */
         float rotXCur, rotYCur, rotZCur;
         findRotation(pointTime, &rotXCur, &rotYCur, &rotZCur);
 
+		/* 找到当前点对应的平移 */
         float posXCur, posYCur, posZCur;
         findPosition(relTime, &posXCur, &posYCur, &posZCur);
 
+		/* 获得初始位姿的逆 */
         if (firstPointFlag == true)
         {
             transStartInverse = (pcl::getTransformation(posXCur, posYCur, posZCur, rotXCur, rotYCur, rotZCur)).inverse();
             firstPointFlag = false;
         }
 
+		/* 获得相对于初始位姿的位姿变换 */
         // transform points to start
         Eigen::Affine3f transFinal = pcl::getTransformation(posXCur, posYCur, posZCur, rotXCur, rotYCur, rotZCur);
         Eigen::Affine3f transBt = transStartInverse * transFinal;
 
+		/* 对当前点进行位姿变换 */
         PointType newPoint;
         newPoint.x = transBt(0,0) * point->x + transBt(0,1) * point->y + transBt(0,2) * point->z + transBt(0,3);
         newPoint.y = transBt(1,0) * point->x + transBt(1,1) * point->y + transBt(1,2) * point->z + transBt(1,3);
@@ -488,6 +543,10 @@ public:
         return newPoint;
     }
 
+	/**
+	 * 根据Velodyne16线雷达的特性，找到点云的行号（线号）和列号（线内序号），
+	 * 按照行列对齐的方式对点云进行重排列
+	 */
     void projectPointCloud()
     {
         int cloudSize = laserCloudIn->points.size();
@@ -503,14 +562,14 @@ public:
             float range = pointDistance(thisPoint);
             if (range < lidarMinRange || range > lidarMaxRange)
                 continue;
-
+			/* 获得当前点的行号（即激光雷达的扫描线号）对应到深度图的纵坐标 */
             int rowIdn = laserCloudIn->points[i].ring;
             if (rowIdn < 0 || rowIdn >= N_SCAN)
                 continue;
 
             if (rowIdn % downsampleRate != 0)
                 continue;
-
+			/* 根据点的水平视角算出点的列号，对应到深度图的横坐标 */
             float horizonAngle = atan2(thisPoint.x, thisPoint.y) * 180 / M_PI;
 
             static float ang_res_x = 360.0/float(Horizon_SCAN);
@@ -521,19 +580,26 @@ public:
             if (columnIdn < 0 || columnIdn >= Horizon_SCAN)
                 continue;
 
+			/* 如果深度图的该位置下已经有数据则略过 */
             if (rangeMat.at<float>(rowIdn, columnIdn) != FLT_MAX)
                 continue;
 
+			/* 基于IMU的角速度的积分结果对当前点进行帧内校正 */
             thisPoint = deskewPoint(&thisPoint, laserCloudIn->points[i].time); // Velodyne
             // thisPoint = deskewPoint(&thisPoint, (float)laserCloudIn->points[i].t / 1000000000.0); // Ouster
 
             rangeMat.at<float>(rowIdn, columnIdn) = range;
-
+			/* 按照行号列号对点云进行重排列，存储到fullCloud中 */
             int index = columnIdn + rowIdn * Horizon_SCAN;
             fullCloud->points[index] = thisPoint;
         }
     }
 
+	/**
+	 * 从整理好的点云中提取有效点，顺序一维化，添加到cloudInfo，准备发布。
+	 * 在projectPointCloud中点云被按照行列的方式整理成二维方式，其中有些点
+	 * 是无效的点，提取过程中这些无效点被滤除。
+	 */
     void cloudExtraction()
     {
         int count = 0;
@@ -560,6 +626,9 @@ public:
         }
     }
     
+	/**
+	 * 发布点云cloudInfo
+	 */
     void publishClouds()
     {
         cloudInfo.header = cloudHeader;

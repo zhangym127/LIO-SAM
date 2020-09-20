@@ -190,8 +190,11 @@ public:
     double lastImuT_imu = -1;
     double lastImuT_opt = -1;
 
+	/* iSAM2优化器 */
     gtsam::ISAM2 optimizer;
+	/* 因子图 */
     gtsam::NonlinearFactorGraph graphFactors;
+	/* 状态变量 */
     gtsam::Values graphValues;
 
     const double delta_t = 0;
@@ -201,29 +204,42 @@ public:
     gtsam::Pose3 imu2Lidar = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(-extTrans.x(), -extTrans.y(), -extTrans.z()));
     gtsam::Pose3 lidar2Imu = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
 
+	/**
+	 * 构造函数 
+	 */
     IMUPreintegration()
     {
+		/* 订阅IMU原始数据，交给imuHandler处理 */
         subImu      = nh.subscribe<sensor_msgs::Imu>  (imuTopic,                   2000, &IMUPreintegration::imuHandler,      this, ros::TransportHints().tcpNoDelay());
+        /* 订阅来自建图模块的里程计信息，交给odometryHandler处理 */
         subOdometry = nh.subscribe<nav_msgs::Odometry>("lio_sam/mapping/odometry_incremental", 5,    &IMUPreintegration::odometryHandler, this, ros::TransportHints().tcpNoDelay());
 
+		/* 创建发布，准备发布IMU里程计信息 */
         pubImuOdometry = nh.advertise<nav_msgs::Odometry> (odomTopic+"_incremental", 2000);
 
+		/* 定义加速度和角速度的白噪声协方差矩阵，定义位姿积分偏差的协方差矩阵*/
         boost::shared_ptr<gtsam::PreintegrationParams> p = gtsam::PreintegrationParams::MakeSharedU(imuGravity);
         p->accelerometerCovariance  = gtsam::Matrix33::Identity(3,3) * pow(imuAccNoise, 2); // acc white noise in continuous
         p->gyroscopeCovariance      = gtsam::Matrix33::Identity(3,3) * pow(imuGyrNoise, 2); // gyro white noise in continuous
         p->integrationCovariance    = gtsam::Matrix33::Identity(3,3) * pow(1e-4, 2); // error committed in integrating position from velocities
+        /* 定义IMU的固有偏差，初值是0 */
         gtsam::imuBias::ConstantBias prior_imu_bias((gtsam::Vector(6) << 0, 0, 0, 0, 0, 0).finished());; // assume zero initial bias
 
+		/* 初始化位姿、速度、偏差等的先验噪声 */
         priorPoseNoise  = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2).finished()); // rad,rad,rad,m, m, m
         priorVelNoise   = gtsam::noiseModel::Isotropic::Sigma(3, 1e4); // m/s
         priorBiasNoise  = gtsam::noiseModel::Isotropic::Sigma(6, 1e-3); // 1e-2 ~ 1e-3 seems to be good
         correctionNoise = gtsam::noiseModel::Isotropic::Sigma(6, 1); // meter
         noiseModelBetweenBias = (gtsam::Vector(6) << imuAccBiasN, imuAccBiasN, imuAccBiasN, imuGyrBiasN, imuGyrBiasN, imuGyrBiasN).finished();
         
+		/* 建立IMU的积分器 */
         imuIntegratorImu_ = new gtsam::PreintegratedImuMeasurements(p, prior_imu_bias); // setting up the IMU integration for IMU message thread
         imuIntegratorOpt_ = new gtsam::PreintegratedImuMeasurements(p, prior_imu_bias); // setting up the IMU integration for optimization        
     }
 
+	/**
+	 * 复位优化器
+	 */
     void resetOptimization()
     {
         gtsam::ISAM2Params optParameters;
@@ -245,16 +261,20 @@ public:
         systemInitialized = false;
     }
 
+	/**
+	 * 处理来自建图模块的里程计消息
+	 */
     void odometryHandler(const nav_msgs::Odometry::ConstPtr& odomMsg)
     {
         std::lock_guard<std::mutex> lock(mtx);
-
+		/* 获得里程计消息的时间戳 */
         double currentCorrectionTime = ROS_TIME(odomMsg);
 
         // make sure we have imu data to integrate
         if (imuQueOpt.empty())
             return;
 
+		/* 从消息中提取位姿：T和R */
         float p_x = odomMsg->pose.pose.position.x;
         float p_y = odomMsg->pose.pose.position.y;
         float p_z = odomMsg->pose.pose.position.z;
@@ -265,6 +285,7 @@ public:
         gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z), gtsam::Point3(p_x, p_y, p_z));
 
 
+		/* 0. 系统初始化 */
         // 0. initialize system
         if (systemInitialized == false)
         {
@@ -341,7 +362,7 @@ public:
             key = 1;
         }
 
-
+		/* 1. 进行IMU数据的积分，并进行优化，积分器由GTSAM提供 */
         // 1. integrate imu data and optimize
         while (!imuQueOpt.empty())
         {
@@ -362,10 +383,12 @@ public:
                 break;
         }
         // add imu factor to graph
+		/* IMU因子是以积分结果的形式添加到因子图中的，添加时需要指定积分前后的状态变量（位姿和速度），以及IMU的积分结果 */
         const gtsam::PreintegratedImuMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedImuMeasurements&>(*imuIntegratorOpt_);
         gtsam::ImuFactor imu_factor(X(key - 1), V(key - 1), X(key), V(key), B(key - 1), preint_imu);
         graphFactors.add(imu_factor);
         // add imu bias between factor
+		/* IMU偏差因子以BetweenFactor的形式添加到因子图，其中的deltaTij()是前后状态之间的时间间隔 */
         graphFactors.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(key - 1), B(key), gtsam::imuBias::ConstantBias(),
                          gtsam::noiseModel::Diagonal::Sigmas(sqrt(imuIntegratorOpt_->deltaTij()) * noiseModelBetweenBias)));
         // add pose factor
@@ -397,7 +420,7 @@ public:
             return;
         }
 
-
+		/* 2. 基于优化后的IMU偏差，对IMU数据进行再次积分 */
         // 2. after optiization, re-propagate imu odometry preintegration
         prevStateOdom = prevState_;
         prevBiasOdom  = prevBias_;
@@ -450,6 +473,9 @@ public:
         return false;
     }
 
+	/**
+	 * 处理来自IMU的原始数据，根据积分的结果对当前的位姿进行估计，然后发布出去
+	 */
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imu_raw)
     {
         std::lock_guard<std::mutex> lock(mtx);
